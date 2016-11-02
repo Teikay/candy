@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"strconv"
 	"sync"
 
 	"github.com/juju/errors"
@@ -14,29 +15,30 @@ import (
 // manager 管理所有session, connection.
 type manager struct {
 	stop     bool
+	host     string
 	notifer  *util.NotiferClient
-	conns    map[string]*connection // 所有的connection
-	sessions map[int64]*session     // 在线用户
+	conns    map[int64]*connection // 根据token索引
+	sessions map[int64]*session    // 根据用户id索引
 	pushChan chan meta.PushRequest
 	sync.RWMutex
 }
 
-func newManager(n *util.NotiferClient) *manager {
+func newManager(n *util.NotiferClient, host string) *manager {
 	m := &manager{
 		notifer:  n,
+		host:     host,
 		sessions: make(map[int64]*session),
-		conns:    make(map[string]*connection),
+		conns:    make(map[int64]*connection),
 		pushChan: make(chan meta.PushRequest, 1000),
 	}
-
-	go m.run()
 
 	return m
 }
 
-func (m *manager) online(id int64, device string, c *connection) {
-	log.Debugf("user:%d, conn:%+v, device:%s", id, c, device)
-	c.setDevice(device)
+func (m *manager) online(id int64, device string, token int64) {
+	log.Debugf("user:%d, token:%d, device:%s", id, token, device)
+
+	c := newConnection(id, token, device)
 
 	m.Lock()
 	s, ok := m.sessions[id]
@@ -47,52 +49,62 @@ func (m *manager) online(id int64, device string, c *connection) {
 
 	s.addConnection(c)
 
-	m.conns[c.getAddr()] = c
+	m.conns[token] = c
 
 	m.Unlock()
 
-	c.setUser(id)
-
 	//订阅消息
-	if err := m.notifer.Subscribe(id, device); err != nil {
+	if err := m.notifer.Subscribe(id, device, token, m.host); err != nil {
 		log.Errorf("%d dev:%s Subscribe error:%s", id, device, errors.ErrorStack(err))
+		return
 	}
 }
 
-func (m *manager) offline(id int64, c *connection) {
-	log.Debugf("user:%d, conn:%+v", id, c)
+func (m *manager) offline(c *connection) {
+	log.Debugf("user:%d, token:%d, dev:%s", c.getUser(), c.getToken(), c.getDevice())
 
 	m.Lock()
-	if s, ok := m.sessions[id]; ok {
+	s, ok := m.sessions[c.getUser()]
+	if ok {
 		s.delConnection(c)
-		delete(m.sessions, id)
+		delete(m.sessions, c.getUser())
 	}
 
-	delete(m.conns, c.getAddr())
+	delete(m.conns, c.getToken())
 
 	m.Unlock()
 
 	//消息订阅
-	if err := m.notifer.Subscribe(id, c.getDevice()); err != nil {
+	if err := m.notifer.UnSubscribe(c.getUser(), c.getDevice(), m.host, c.getToken()); err != nil {
 		log.Errorf("UnSubscribe error:%s", errors.ErrorStack(err))
 	}
 }
 
-func (m *manager) getConnection(ctx context.Context) (c *connection, ok bool, err error) {
-	var addr string
-
-	if addr, err = util.ContextAddr(ctx); err != nil {
-		return
-	}
-	log.Debugf("conn from:%s, conns:%+v", addr, m.conns)
+//getConnByToken 根据int64的token获取对应的connection.
+func (m *manager) getConnByToken(token int64) *connection {
 	m.Lock()
-	if c, ok = m.conns[addr]; !ok {
-		c = newConnection(addr)
-		m.conns[addr] = c
-		log.Debugf("conn from:%s, c:%+v", addr, c)
-	}
+	c, ok := m.conns[token]
 	m.Unlock()
-	return
+
+	if ok {
+		return c
+	}
+	return nil
+}
+
+func (m *manager) getConnection(ctx context.Context) *connection {
+	t, err := util.ContextGet(ctx, "token")
+	if err != nil {
+		log.Errorf("get token error:%s, ctx:%+v", errors.ErrorStack(err), ctx)
+		return nil
+	}
+
+	token, err := strconv.ParseInt(t, 10, 64)
+	if err != nil {
+		log.Errorf("ParseInt token:%s error:%s", t, err.Error())
+		return nil
+	}
+	return m.getConnByToken(token)
 }
 
 func (m *manager) getUserSession(id int64) *session {
@@ -106,40 +118,37 @@ func (m *manager) getUserSession(id int64) *session {
 	return s
 }
 
-func (m *manager) getSession(ctx context.Context) (*session, *connection, error) {
-	c, ok, err := m.getConnection(ctx)
-	if err != nil {
-		return nil, nil, errors.Trace(err)
+//getSessionByToken 据int64的token获取对应的session.
+func (m *manager) getSessionByToken(token int64) *session {
+	c := m.getConnByToken(token)
+	if c == nil {
+		return nil
 	}
 
-	if !ok || c.getUser() == 0 {
-		return nil, c, errors.Trace(util.ErrInvalidContext)
-	}
-
-	s := m.getUserSession(c.getUser())
-	if s == nil {
-		return nil, c, errors.Trace(util.ErrInvalidContext)
-	}
-
-	return s, c, nil
+	return m.getUserSession(c.getUser())
 }
 
-func (m *manager) run() {
-	for !m.stop {
-		req, err := m.notifer.Recv()
-		if err != nil {
-			log.Errorf("recv push message error:%s", err)
+func (m *manager) getSession(ctx context.Context) *session {
+	c := m.getConnection(ctx)
+	if c == nil {
+		return nil
+	}
+
+	return m.getUserSession(c.getUser())
+}
+
+func (m *manager) pushMessage(req *meta.PushRequest) {
+	for _, id := range req.ID {
+		s := m.getUserSession(id.User)
+		if s == nil {
 			continue
 		}
-		for _, id := range req.ID {
-			s := m.getUserSession(id.User)
-			if s == nil {
-				continue
+		s.walkConnection(func(c *connection) bool {
+			if err := c.send(&req.Msg); err != nil {
+				log.Infof("send Msg:%v, to:%d addr:%s, last:%v, err:%s", req.Msg.Msg.ID, id.User, c.getToken(), c.last, errors.ErrorStack(err))
+				m.offline(c)
 			}
-			s.walkConnection(func(c *connection) bool {
-				c.send(&req.Msg)
-				return false
-			})
-		}
+			return false
+		})
 	}
 }
